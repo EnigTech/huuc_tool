@@ -930,6 +930,10 @@ class App:
         if self.start_minimized_var.get() and self.tray is not None:
             self.root.after(0, self._startup_minimize)
 
+        # 启动时若检测到注册表里已存在有效账密，则自动开始监控（无论窗口是否显示）。
+        # 放在 after(0) 里，等主循环真正起来后再启动线程，保证 UI 日志能正常刷新。
+        self.root.after(0, self._auto_start_monitor)
+
     def _apply_window_icon(self):
         """给主窗口设置自定义图标：优先 Win32 WM_SETICON（可从 exe 资源读取），
         并额外尝试 tkinter 的 iconbitmap（对源码运行 + 同目录 app.ico 最直接）。"""
@@ -1072,17 +1076,38 @@ class App:
         threading.Thread(target=worker, daemon=True).start()
 
     def _start(self):
-        interval = self._validate_interval()
-        if interval is None:
-            return
+        """用户点击"开始监控"按钮。"""
+        self._start_monitor(manual=True)
+
+    def _start_monitor(self, manual=True):
+        """启动监控线程。
+
+        manual=True  ：用户点击"开始监控"触发——校验间隔、弹窗提示，并把账密写回注册表；
+        manual=False ：程序启动时自动触发——仅在注册表已存在有效账密时由调用方进入，
+                       不弹窗、不重写注册表，保持静默。
+        """
+        if manual:
+            interval = self._validate_interval()
+            if interval is None:
+                return
+        else:
+            # 自动启动模式：间隔读自注册表，理论上必然合法，非法时退回默认值
+            try:
+                interval = max(3, int(self.interval_var.get()))
+            except Exception:
+                interval = DEFAULT_INTERVAL_SEC
+
         acc = self.acc_var.get().strip()
         pwd = self.pwd_var.get()
         if not acc or not pwd:
-            messagebox.showwarning("提示", "请先填写账号和密码并保存。")
+            if manual:
+                messagebox.showwarning("提示", "请先填写账号和密码并保存。")
             return
-        # 开始监控时顺带把当前账密与间隔写入注册表（等价于点一次"保存配置"）
-        save_credentials(acc, pwd)
-        reg_save_interval(interval)
+
+        if manual:
+            # 点"开始监控"时顺带把当前账密与间隔写入注册表（等价于点一次"保存配置"）
+            save_credentials(acc, pwd)
+            reg_save_interval(interval)
 
         if self.monitor and self.monitor.is_alive():
             return
@@ -1091,6 +1116,19 @@ class App:
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
         self._set_status("正在检测...", None)
+
+    def _auto_start_monitor(self):
+        """程序启动时：若注册表中已保存有效账号密码，则自动开始监控，无需手动点击。"""
+        if self.monitor and self.monitor.is_alive():
+            return
+        acc = self.acc_var.get().strip()
+        pwd = self.pwd_var.get()
+        if not acc or not pwd:
+            self._log("未检测到已保存的账号密码，未自动启动监控。"
+                      "填写并保存后，点“开始监控”即可。", "orange")
+            return
+        self._log("检测到已保存的账号密码，自动开始监控。", "")
+        self._start_monitor(manual=False)
 
     def _stop(self):
         if self.monitor:
