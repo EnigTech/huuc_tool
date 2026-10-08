@@ -91,6 +91,7 @@ SETTINGS_VALUE_START_MINIMIZED = "StartMinimized" # REG_DWORD：1=启动即最�
 SETTINGS_VALUE_ACCOUNT = "Account"                # REG_SZ（轻度混淆后的字符串）
 SETTINGS_VALUE_PASSWORD = "Password"              # REG_SZ（轻度混淆后的字符串）
 SETTINGS_VALUE_INTERVAL = "Interval"              # REG_DWORD：检测间隔秒数
+SETTINGS_VALUE_CARRIER = "Carrier"                # REG_SZ：运营商（"unicom" / "cmcc"）
 
 _REG_DWORD = winreg.REG_DWORD if winreg else 0
 _REG_SZ = winreg.REG_SZ if winreg else 0
@@ -146,7 +147,7 @@ def _deobfuscate(s):
 def reg_load_settings():
     """从注册表一次性读取全部设置。返回 dict：
        {"account": str, "password": str, "interval": int,
-        "allow_bg": bool, "start_minimized": bool}
+        "allow_bg": bool, "start_minimized": bool, "carrier": str}
        缺失项用默认值补齐。若 start_minimized=True，则 allow_bg 强制为 True。"""
     result = {
         "account": "",
@@ -154,6 +155,7 @@ def reg_load_settings():
         "interval": DEFAULT_INTERVAL_SEC,
         "allow_bg": True,
         "start_minimized": False,
+        "carrier": "unicom",
     }
     v = _reg_read(SETTINGS_VALUE_ACCOUNT)
     if isinstance(v, str):
@@ -178,6 +180,10 @@ def reg_load_settings():
         result["start_minimized"] = bool(int(v))
     except (TypeError, ValueError):
         pass
+    # 读取运营商选择（无效值按默认联通处理）
+    v = _reg_read(SETTINGS_VALUE_CARRIER)
+    if v in ("unicom", "cmcc"):
+        result["carrier"] = v
     # 一致性约束：勾选"默认后台运行"时，"允许后台运行"必须为 True
     if result["start_minimized"]:
         result["allow_bg"] = True
@@ -195,6 +201,14 @@ def reg_save_credentials(account, password):
 def reg_save_interval(seconds):
     """把检测间隔写入注册表。返回 (成功?, 错误信息)。"""
     return _reg_write(SETTINGS_VALUE_INTERVAL, int(seconds), _REG_DWORD)
+
+
+def reg_save_carrier(carrier):
+    """把运营商选择写入注册表。carrier 取值："unicom" 或 "cmcc"。
+    返回 (成功?, 错误信息)。"""
+    if carrier not in ("unicom", "cmcc"):
+        carrier = "unicom"
+    return _reg_write(SETTINGS_VALUE_CARRIER, carrier, _REG_SZ)
 
 
 def set_allow_background(enabled):
@@ -275,8 +289,18 @@ def reg_clear_settings(include_autostart=True):
 
 # ==================== 配置区 ====================
 ACCOUNT = ""                       # 学号/账号（启动时从注册表加载）
-ACCOUNT_SUFFIX = "@unicom"         # 认证账号后缀；若账号本身已含后缀则不会重复拼接
+ACCOUNT_SUFFIX = "@unicom"         # 认证账号后缀；运行时会按注册表里的运营商动态更新
 PASSWORD = ""                      # 密码（启动时从注册表加载）
+
+# 运营商 → 账号后缀 / 显示名称映射（二选一：联通 / 移动）
+CARRIER_SUFFIX = {
+    "unicom": "@unicom",
+    "cmcc":   "@cmcc",
+}
+CARRIER_LABEL = {
+    "unicom": "联通",
+    "cmcc":   "移动",
+}
 
 LOGIN_URL = "https://netauth.huuc.edu.cn:802/eportal/portal/login"
 PORTAL_URL = "https://netauth.huuc.edu.cn:802/eportal/portal/jsp/portal/tp-common-redirect.jsp"
@@ -312,10 +336,11 @@ UI_QUEUE = queue.Queue()
 
 # ==================== 核心逻辑（与原版保持一致） ====================
 def load_credentials():
-    """启动时从注册表加载账号密码到全局变量。返回 (account, password)。"""
-    global ACCOUNT, PASSWORD
+    """启动时从注册表加载账号密码和运营商到全局变量。返回 (account, password)。"""
+    global ACCOUNT, PASSWORD, ACCOUNT_SUFFIX
     s = reg_load_settings()
     ACCOUNT, PASSWORD = s["account"], s["password"]
+    ACCOUNT_SUFFIX = CARRIER_SUFFIX.get(s["carrier"], "@unicom")
     return ACCOUNT, PASSWORD
 
 
@@ -905,6 +930,7 @@ class App:
         self.acc_var = tk.StringVar(value=settings["account"])
         self.pwd_var = tk.StringVar(value=settings["password"])
         self.interval_var = tk.StringVar(value=str(settings["interval"]))
+        self.carrier_var = tk.StringVar(value=settings["carrier"])   # 运营商选择
         self.status_var = tk.StringVar(value="未启动")
         self.hit_var = tk.StringVar(value="-")
         # 开机自启勾选框：初始值同步当前注册表状态，保证重启程序后勾选状态正确
@@ -917,6 +943,8 @@ class App:
         self._build_ui()
         # 应用"默认后台运行"对"允许后台运行"的联动约束（强制勾选 + 置灰）
         self._sync_allow_bg_ui()
+        # 应用"运营商"选择，同步全局 ACCOUNT_SUFFIX 与界面后缀标签
+        self._apply_carrier_to_ui()
         # 设置主窗口图标（标题栏 + 任务栏），从 exe 资源或磁盘 app.ico 读取
         self._apply_window_icon()
         self._setup_tray()
@@ -973,18 +1001,31 @@ class App:
 
         ttk.Label(cfg, text="检测间隔(秒):").grid(row=2, column=0, sticky="w")
         ttk.Entry(cfg, textvariable=self.interval_var, width=8).grid(row=2, column=1, sticky="w", padx=4)
-        ttk.Label(cfg, text="（账号后缀：%s）" % ACCOUNT_SUFFIX).grid(row=2, column=2, sticky="w")
+        # 保存引用，切换运营商时动态刷新显示
+        self.suffix_label = ttk.Label(cfg, text="（账号后缀：%s）" % ACCOUNT_SUFFIX)
+        self.suffix_label.grid(row=2, column=2, sticky="w")
+
+        # --- 运营商二选一（联通 / 移动）---
+        ttk.Label(cfg, text="运营商:").grid(row=3, column=0, sticky="w")
+        carrier_frame = ttk.Frame(cfg)
+        carrier_frame.grid(row=3, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Radiobutton(carrier_frame, text="联通", value="unicom",
+                        variable=self.carrier_var,
+                        command=self._on_carrier_change).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(carrier_frame, text="移动", value="cmcc",
+                        variable=self.carrier_var,
+                        command=self._on_carrier_change).pack(side="left")
 
         # 第一行按钮：保存 / 测试 / 清除注册表
         btns = ttk.Frame(cfg)
-        btns.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        btns.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Button(btns, text="保存配置", command=self._save).pack(side="left", padx=4)
         ttk.Button(btns, text="测试连接", command=self._test).pack(side="left", padx=4)
         ttk.Button(btns, text="清除注册表", command=self._clear_registry).pack(side="left", padx=4)
 
         # 第二行：三个勾选框
         chks = ttk.Frame(cfg)
-        chks.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        chks.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
         ttk.Checkbutton(chks, text="开机自启", variable=self.autostart_var,
                         command=self._on_autostart_toggle).pack(side="left", padx=4)
         # 保留"允许后台运行"复选框的引用，用于按"默认后台运行"状态启用/禁用
@@ -1035,6 +1076,33 @@ class App:
     def _toggle_pwd(self):
         self.pwd_entry.configure(show="" if self.show_pwd.get() else "*")
 
+    def _apply_carrier_to_ui(self):
+        """根据当前 carrier_var 同步全局 ACCOUNT_SUFFIX 和界面后缀标签。"""
+        global ACCOUNT_SUFFIX
+        carrier = self.carrier_var.get()
+        if carrier not in CARRIER_SUFFIX:
+            carrier = "unicom"
+            self.carrier_var.set(carrier)
+        ACCOUNT_SUFFIX = CARRIER_SUFFIX[carrier]
+        try:
+            self.suffix_label.configure(text="（账号后缀：%s）" % ACCOUNT_SUFFIX)
+        except Exception:
+            pass
+
+    def _on_carrier_change(self):
+        """运营商单选按钮切换：立即更新后缀并写入注册表。"""
+        carrier = self.carrier_var.get()
+        if carrier not in CARRIER_SUFFIX:
+            carrier = "unicom"
+            self.carrier_var.set(carrier)
+        self._apply_carrier_to_ui()
+        ok, err = reg_save_carrier(carrier)
+        if ok:
+            self._log("已切换运营商为%s（账号后缀 %s），已保存到注册表。" %
+                      (CARRIER_LABEL[carrier], ACCOUNT_SUFFIX), "")
+        else:
+            self._log("保存运营商选择失败：%s" % err, "red")
+
     def _save(self):
         acc = self.acc_var.get().strip()
         pwd = self.pwd_var.get()
@@ -1046,8 +1114,9 @@ class App:
             return
         ok1, err1 = save_credentials(acc, pwd)
         ok2, err2 = reg_save_interval(interval)
-        if not ok1 or not ok2:
-            err = err1 or err2
+        ok3, err3 = reg_save_carrier(self.carrier_var.get())
+        if not ok1 or not ok2 or not ok3:
+            err = err1 or err2 or err3
             self._log("保存到注册表失败：%s" % err, "red")
             messagebox.showerror("提示", "保存到注册表失败：%s" % err)
             return
@@ -1067,6 +1136,8 @@ class App:
         if not acc or not pwd:
             messagebox.showwarning("提示", "请先填写账号和密码。")
             return
+        # 测试前先按当前单选按钮同步 ACCOUNT_SUFFIX（不写注册表，仅内存）
+        self._apply_carrier_to_ui()
         self._log("正在测试登录（账号 %s）..." % full_account(acc), "")
 
         def worker():
@@ -1104,10 +1175,14 @@ class App:
                 messagebox.showwarning("提示", "请先填写账号和密码并保存。")
             return
 
+        # 无论手动还是自动，启动前都按当前界面选择同步一次后缀，保证认证用对运营商
+        self._apply_carrier_to_ui()
+
         if manual:
-            # 点"开始监控"时顺带把当前账密与间隔写入注册表（等价于点一次"保存配置"）
+            # 点"开始监控"时顺带把当前账密、间隔、运营商写入注册表（等价于点一次"保存配置"）
             save_credentials(acc, pwd)
             reg_save_interval(interval)
+            reg_save_carrier(self.carrier_var.get())
 
         if self.monitor and self.monitor.is_alive():
             return
@@ -1200,6 +1275,7 @@ class App:
             "将清除本程序在注册表中的全部配置：\n"
             "  · 账号 / 密码\n"
             "  · 检测间隔\n"
+            "  · 运营商（联通 / 移动）\n"
             "  · 允许后台运行 / 默认后台运行\n"
             "  · 开机自启\n\n"
             "清除后界面会恢复为默认值，确定继续？"
@@ -1215,11 +1291,13 @@ class App:
         self.acc_var.set(settings["account"])             # 空
         self.pwd_var.set(settings["password"])            # 空
         self.interval_var.set(str(settings["interval"]))  # 5
+        self.carrier_var.set(settings["carrier"])         # 默认联通
         self.allow_bg_var.set(settings["allow_bg"])       # True
         self.start_minimized_var.set(settings["start_minimized"])  # False
         self.autostart_var.set(is_autostart_enabled())    # False
         self._sync_allow_bg_ui()                          # 恢复"允许后台运行"可编辑
-        self._log("已清除注册表配置，并恢复默认值（账号/密码清空、间隔=5s、各勾选恢复默认）。", "")
+        self._apply_carrier_to_ui()                       # 同步后缀和标签
+        self._log("已清除注册表配置，并恢复默认值（账号/密码清空、间隔=5s、运营商=联通、各勾选恢复默认）。", "")
         messagebox.showinfo("提示", "注册表配置已清除并恢复默认。")
 
     # ---------- 系统托盘（后台运行） ----------
@@ -1427,7 +1505,7 @@ def main():
     # 防止多开：若已有实例在运行，则唤起其窗口并直接退出本进程（不再启动第二个）
     if not SINGLE.acquire():
         return
-    load_credentials()          # 从注册表加载账号密码到全局变量
+    load_credentials()          # 从注册表加载账号密码和运营商到全局变量
     root = tk.Tk()
     App(root)
     # 第二个实例再次启动时，经 UI_QUEUE 转交主线程唤起窗口（线程安全，复用托盘"打开"逻辑：
