@@ -123,9 +123,13 @@ def _reg_read(name):
 
 
 def _obfuscate(s):
-    """轻度混淆（非加密）：XOR + Base64。"""
+    """轻度混淆（非加密）：XOR + Base64。
+
+    按 UTF-8 字节处理，因此账号/密码里有中文也不会出错。
+    纯 ASCII 时与原实现完全一致，可兼容读取旧数据。
+    """
     import base64
-    raw = bytes(ord(c) ^ 0x5A for c in s)
+    raw = bytes(b ^ 0x5A for b in str(s).encode("utf-8"))
     return base64.b64encode(raw).decode("ascii")
 
 
@@ -135,9 +139,13 @@ def _deobfuscate(s):
         return ""
     try:
         raw = base64.b64decode(str(s).encode("ascii"))
-        return "".join(chr(b ^ 0x5A) for b in raw)
     except Exception:
         return ""
+    try:
+        return bytes(b ^ 0x5A for b in raw).decode("utf-8")
+    except UnicodeDecodeError:
+        # 兼容极旧的、按单个字符异或写入的数据
+        return "".join(chr(b ^ 0x5A) for b in raw)
 
 
 def reg_load_settings():
@@ -304,7 +312,13 @@ def save_credentials(account, password):
 
 def full_account(account=None):
     acc = account if account is not None else ACCOUNT
-    if acc.endswith(ACCOUNT_SUFFIX) or not ACCOUNT_SUFFIX:
+    acc = acc.strip()
+    # 切过运营商后账号可能还带着旧后缀（如 xxx@unicom），先去掉再统一加上当前后缀
+    for suf in CARRIER_SUFFIX.values():
+        if acc.endswith(suf):
+            acc = acc[: -len(suf)]
+            break
+    if not ACCOUNT_SUFFIX:
         return acc
     return acc + ACCOUNT_SUFFIX
 
@@ -397,7 +411,7 @@ def parse_result(body):
         if mm:
             msg = mm.group(1)
 
-    ok_kw = ["成功", "已登录", "认证成功", "登录成功", "AC999"]
+    ok_kw = ["认证成功", "登录成功", "成功", "已登录", "已在线", "AC999"]
     if any(k in msg for k in ok_kw):
         return True, msg
     fail_kw = ["不存在", "错误", "失败", "密码", "超时", "在线", "绑定", "已用"]
@@ -459,7 +473,7 @@ def do_login(account=None, password=None, allow_interactive=True):
     fetch_portal_cookie()
 
     key = calc_key_from_ip(local_ip)
-    _log_debug("本机 IP: %s，账号: %s，加密密钥: 0x%02X",
+    _log_debug("本机 IP: %s，账号: %s，加密密钥: 0x%02X（jsVersion=%s）",
                local_ip, full_account(acc), key, JS_VERSION)
 
     ok, msg = _try_login_with_key(acc, pwd, local_ip, key, JS_VERSION)
@@ -483,9 +497,13 @@ def init_file_logger():
     logger.setLevel(logging.INFO)
     if not logger.handlers:
         fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-        fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
+        try:
+            fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+        except Exception:
+            # 目录只读等情况下退化为不写文件，避免程序无法启动
+            logger.addHandler(logging.NullHandler())
     return logger
 
 
@@ -517,6 +535,10 @@ class MonitorThread(threading.Thread):
 
     def stop(self):
         self._stop_evt.set()
+
+    @property
+    def stopping(self):
+        return self._stop_evt.is_set()
 
     def _wait(self, seconds):
         return self._stop_evt.wait(seconds)
@@ -625,6 +647,8 @@ if sys.platform.startswith("win"):
     WM_LBUTTONDBLCLK = 0x0203
     WM_RBUTTONUP = 0x0205
     WM_QUIT = 0x0012
+    WM_TIMER = 0x0113
+    WM_NULL = 0x0000
     IDI_APPLICATION = 32512
     MF_STRING = 0
     MF_SEPARATOR = 0x0800
@@ -693,6 +717,17 @@ if sys.platform.startswith("win"):
     _user32.SendMessageW.restype = ctypes.c_ssize_t
     _user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
                                       wintypes.WPARAM, wintypes.LPARAM]
+    # 托盘图标恢复（资源管理器重启广播 / 定时重试）所需的 API
+    _user32.RegisterWindowMessageW.restype = wintypes.UINT
+    _user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+    _user32.PostMessageW.restype = wintypes.BOOL
+    _user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                     wintypes.WPARAM, wintypes.LPARAM]
+    _user32.SetTimer.restype = ctypes.c_size_t
+    _user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t,
+                                 wintypes.UINT, ctypes.c_void_p]
+    _user32.KillTimer.restype = wintypes.BOOL
+    _user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
 
 
     def _load_app_hicon():
@@ -726,6 +761,13 @@ if sys.platform.startswith("win"):
 
 
     class TrayIcon:
+        """系统托盘图标。
+
+        explorer.exe 重启后，任务栏会丢弃所有第三方托盘图标（只保留系统图标），
+        必须监听 "TaskbarCreated" 广播后重新添加；否则窗口一旦隐藏，
+        托盘里又没有图标，程序就再也无法找回，表现为“最小化到托盘失效”。
+        """
+
         def __init__(self, on_open, on_exit, tooltip="huuc校园网自动重连工具"):
             self._on_open = on_open
             self._on_exit = on_exit
@@ -737,81 +779,203 @@ if sys.platform.startswith("win"):
             self._wndproc_cb = None
             self._class_name = "RenzhengTray_%d" % id(self)
             self._WM_TRAY = WM_APP + 1
+            self._WM_SYNC_ADD = WM_APP + 2
+            self._WM_SYNC_DEL = WM_APP + 3
+            self._WM_TASKBARCREATED = 0
             self._ID_OPEN = 1001
             self._ID_EXIT = 1002
+            self._TIMER_RETRY = 1
+            self._RETRY_MS = 2000
+            self._icon_added = False
+            self._closing = False
+            self._error = ""
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._ready = threading.Event()
 
+        # ---------- 对外接口（供界面线程调用） ----------
         def start(self):
             self._thread.start()
 
+        @property
+        def available(self):
+            return self._hwnd is not None and self._thread.is_alive()
+
+        @property
+        def icon_ready(self):
+            return bool(self._icon_added)
+
+        def ensure_icon(self):
+            """确保图标已加入托盘；未加入时立刻在托盘线程里重加一次。"""
+            if self._icon_added:
+                return True
+            hwnd = self._hwnd
+            if hwnd is None:
+                return False
+            # 用同步消息把添加动作交给托盘线程执行：
+            # 既避免跨线程调用 Shell_NotifyIconW 的不确定性，又能拿到真实结果
+            try:
+                return bool(_user32.SendMessageW(hwnd, self._WM_SYNC_ADD, 0, 0))
+            except Exception:
+                return False
+
         def shutdown(self):
+            self._closing = True
+            hwnd = self._hwnd
+            if hwnd is not None:
+                try:
+                    _user32.SendMessageW(hwnd, self._WM_SYNC_DEL, 0, 0)
+                except Exception:
+                    self._remove_icon()
+            else:
+                self._remove_icon()
             if self._thread_id is not None:
                 _user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
             if self._thread.is_alive():
                 self._thread.join(timeout=2.0)
 
-        def wait_ready(self, timeout=1.0):
+        def wait_ready(self, timeout=1.5):
             return self._ready.wait(timeout)
 
         def _run(self):
-            self._thread_id = _kernel32.GetCurrentThreadId()
-            self._hicon = _load_app_hicon()
-            if not self._hicon:
+            try:
+                self._thread_id = _kernel32.GetCurrentThreadId()
+                self._hicon = _load_app_hicon()
+                if not self._hicon:
+                    self._error = "无法加载程序图标"
+                    return
+
+                wc = WNDCLASSW()
+                wc.style = 0
+                wc.cbClsExtra = 0
+                wc.cbWndExtra = 0
+                wc.hInstance = _kernel32.GetModuleHandleW(None)
+                wc.hIcon = self._hicon
+                wc.hCursor = None
+                wc.hbrBackground = None
+                wc.lpszMenuName = None
+                wc.lpszClassName = self._class_name
+
+                self._wndproc_cb = WNDPROC(self._wndproc)
+                wc.lpfnWndProc = ctypes.cast(self._wndproc_cb, ctypes.c_void_p)
+
+                if _user32.RegisterClassW(ctypes.byref(wc)) == 0:
+                    self._error = "RegisterClassW 失败"
+                    return
+
+                self._hwnd = _user32.CreateWindowExW(
+                    0, self._class_name, None, 0,
+                    0, 0, 0, 0, None, None, wc.hInstance, None,
+                )
+                if not self._hwnd:
+                    self._error = "CreateWindowExW 失败"
+                    return
+
+                # 资源管理器重启时会广播该消息，收到后要重新添加图标
+                self._WM_TASKBARCREATED = _user32.RegisterWindowMessageW("TaskbarCreated")
+
+                nid = NOTIFYICONDATAW()
+                nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+                nid.hWnd = self._hwnd
+                nid.uID = 1
+                nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+                nid.uCallbackMessage = self._WM_TRAY
+                nid.hIcon = self._hicon
+                nid.szTip = self._tooltip
+                self._nid = nid
+                self._add_icon()
+                self._ready.set()
+
+                msg = wintypes.MSG()
+                while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                    _user32.TranslateMessage(ctypes.byref(msg))
+                    _user32.DispatchMessageW(ctypes.byref(msg))
+            except Exception as e:
+                self._error = "%s: %s" % (type(e).__name__, e)
+            finally:
+                self._ready.set()
+                self._remove_icon()
+                try:
+                    if self._hwnd:
+                        _user32.KillTimer(self._hwnd, self._TIMER_RETRY)
+                        _user32.DestroyWindow(self._hwnd)
+                        self._hwnd = None
+                except Exception:
+                    pass
+
+        def _add_icon(self, force=False):
+            """调用 Shell_NotifyIconW 添加图标；失败时启动定时重试。
+
+            注意：同一个 hWnd+uID 重复 NIM_ADD 在 Windows 上会返回 FALSE
+            （实测 Win11），所以重加前必须先 NIM_DELETE，否则会把状态误判成失败。
+            """
+            if self._closing or self._nid is None or self._hwnd is None:
+                return False
+            if force or self._icon_added:
+                try:
+                    _shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
+                except Exception:
+                    pass
+                self._icon_added = False
+            try:
+                ok = bool(_shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)))
+            except Exception:
+                ok = False
+            self._icon_added = ok
+            if ok:
+                self._kill_retry_timer()
+            else:
+                self._arm_retry_timer()
+            return ok
+
+        def _remove_icon(self):
+            nid = self._nid
+            if nid is None:
                 return
+            self._icon_added = False
+            try:
+                _shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+            except Exception:
+                pass
 
-            wc = WNDCLASSW()
-            wc.style = 0
-            wc.cbClsExtra = 0
-            wc.cbWndExtra = 0
-            wc.hInstance = _kernel32.GetModuleHandleW(None)
-            wc.hIcon = self._hicon
-            wc.hCursor = None
-            wc.hbrBackground = None
-            wc.lpszMenuName = None
-            wc.lpszClassName = self._class_name
-
-            self._wndproc_cb = WNDPROC(self._wndproc)
-            wc.lpfnWndProc = ctypes.cast(self._wndproc_cb, ctypes.c_void_p)
-
-            if _user32.RegisterClassW(ctypes.byref(wc)) == 0:
+        def _arm_retry_timer(self):
+            if self._hwnd is None or self._closing:
                 return
+            try:
+                _user32.SetTimer(self._hwnd, self._TIMER_RETRY, self._RETRY_MS, None)
+            except Exception:
+                pass
 
-            self._hwnd = _user32.CreateWindowExW(
-                0, self._class_name, None, 0,
-                0, 0, 0, 0, None, None, wc.hInstance, None,
-            )
-            if not self._hwnd:
+        def _kill_retry_timer(self):
+            if self._hwnd is None:
                 return
-
-            nid = NOTIFYICONDATAW()
-            nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-            nid.hWnd = self._hwnd
-            nid.uID = 1
-            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-            nid.uCallbackMessage = self._WM_TRAY
-            nid.hIcon = self._hicon
-            nid.szTip = self._tooltip
-            _shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
-            self._nid = nid
-            self._ready.set()
-
-            msg = wintypes.MSG()
-            while _user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-                _user32.TranslateMessage(ctypes.byref(msg))
-                _user32.DispatchMessageW(ctypes.byref(msg))
-
-            if self._nid is not None:
-                _shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
-            if self._hwnd is not None:
-                _user32.DestroyWindow(self._hwnd)
+            try:
+                _user32.KillTimer(self._hwnd, self._TIMER_RETRY)
+            except Exception:
+                pass
 
         def _wndproc(self, hwnd, msg, wparam, lparam):
-            if msg == self._WM_TRAY:
-                if lparam == WM_LBUTTONUP or lparam == WM_LBUTTONDBLCLK:
-                    self._safe_call(self._on_open)
-                elif lparam == WM_RBUTTONUP:
-                    self._show_menu(hwnd)
+            try:
+                if msg == self._WM_TRAY:
+                    if lparam == WM_LBUTTONUP or lparam == WM_LBUTTONDBLCLK:
+                        self._safe_call(self._on_open)
+                    elif lparam == WM_RBUTTONUP:
+                        self._show_menu(hwnd)
+                    return 0
+                if self._WM_TASKBARCREATED and msg == self._WM_TASKBARCREATED:
+                    # 资源管理器重启了，旧图标已失效，重新添加
+                    self._add_icon(force=True)
+                    return 0
+                if msg == WM_TIMER and wparam == self._TIMER_RETRY:
+                    if not self._icon_added:
+                        self._add_icon(force=True)
+                    return 0
+                if msg == self._WM_SYNC_ADD:
+                    return 1 if self._add_icon(force=True) else 0
+                if msg == self._WM_SYNC_DEL:
+                    self._remove_icon()
+                    return 1
+            except Exception:
+                pass
             return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
         def _show_menu(self, hwnd):
@@ -825,6 +989,8 @@ if sys.platform.startswith("win"):
             cmd = _user32.TrackPopupMenu(
                 menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, None
             )
+            # 官方建议：菜单结束后给窗口发一个空消息，避免菜单残留在屏幕上
+            _user32.PostMessageW(hwnd, WM_NULL, 0, 0)
             _user32.DestroyMenu(menu)
             if cmd == self._ID_OPEN:
                 self._safe_call(self._on_open)
@@ -848,6 +1014,14 @@ else:
             pass
         def wait_ready(self, timeout=1.0):
             return False
+        @property
+        def available(self):
+            return False
+        @property
+        def icon_ready(self):
+            return False
+        def ensure_icon(self):
+            return False
 
     def set_window_icon(root):
         pass
@@ -863,6 +1037,7 @@ class App:
         self.monitor = None
         self.tray = None
         self._quitting = False
+        self._poll_after = None
 
         settings = reg_load_settings()
 
@@ -884,8 +1059,10 @@ class App:
         self._apply_window_icon()
         self._setup_tray()
 
-        self.root.after(120, self._poll_queue)
+        self._poll_after = self.root.after(120, self._poll_queue)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        # 点“最小化”按钮时也收进托盘（仅在允许后台运行时）
+        self.root.bind("<Unmap>", self._on_unmap, add="+")
 
         if self.start_minimized_var.get() and self.tray is not None:
             self.root.after(0, self._startup_minimize)
@@ -1101,11 +1278,17 @@ class App:
         self._apply_carrier_to_ui()
 
         if manual:
-            save_credentials(acc, pwd)
-            reg_save_interval(interval)
-            reg_save_carrier(self.carrier_var.get())
+            ok1, err1 = save_credentials(acc, pwd)
+            ok2, err2 = reg_save_interval(interval)
+            ok3, err3 = reg_save_carrier(self.carrier_var.get())
+            if not (ok1 and ok2 and ok3):
+                self._log("保存配置失败：%s" % (err1 or err2 or err3), "red")
 
         if self.monitor and self.monitor.is_alive():
+            if getattr(self.monitor, "stopping", False):
+                self._log("上一轮监控仍在退出，请稍候再点“开始监控”。", "orange")
+            elif manual:
+                self._log("监控已经在运行中。", "orange")
             return
         self.monitor = MonitorThread(interval, acc, pwd)
         self.monitor.start()
@@ -1214,8 +1397,13 @@ class App:
         try:
             self.tray = TrayIcon(on_open=self._on_tray_open, on_exit=self._on_tray_exit)
             self.tray.start()
-            if self.tray.wait_ready(timeout=1.0):
-                self._log("已启用系统托盘。", "")
+            if self.tray.wait_ready(timeout=1.5) and self.tray.available:
+                if self.tray.icon_ready:
+                    self._log("已启用系统托盘。", "")
+                else:
+                    # 图标没注册成功（例如开机自启时任务栏还没起来）：
+                    # TrayIcon 内部会自动重试，并在资源管理器重启后自动重建
+                    self._log("托盘已就绪，图标注册暂未成功，正在后台自动重试。", "orange")
             else:
                 self.tray = None
                 self._log("系统托盘初始化失败，关闭窗口将直接退出。", "orange")
@@ -1234,21 +1422,76 @@ class App:
         UI_QUEUE.put(("tray", "exit"))
 
     def _show_window(self):
-        self.root.deiconify()
-        self.root.lift()
-        self.root.focus_force()
+        if self._quitting:
+            return
+        try:
+            self.root.deiconify()
+            if self.root.state() == "iconic":
+                self.root.state("normal")
+            self.root.lift()
+            self.root.focus_force()
+        except tk.TclError:
+            pass
+
+    def _hide_to_tray(self):
+        try:
+            self.root.withdraw()
+        except tk.TclError:
+            return
+        self._log("已最小化到系统托盘。左键单击图标可重新打开，右键可“打开/退出”。", "")
+
+    def _on_unmap(self, event):
+        """点了窗口的“最小化”按钮：允许后台运行时收进托盘。"""
+        if event.widget is not self.root:
+            return
+        if self._quitting or self.tray is None or not self.allow_bg_var.get():
+            return
+        # 等状态真正变成 iconic 之后再判断，避免误把普通隐藏当成最小化
+        try:
+            self.root.after(10, self._minimize_to_tray)
+        except tk.TclError:
+            pass
+
+    def _minimize_to_tray(self):
+        if self._quitting or self.tray is None:
+            return
+        try:
+            if self.root.state() != "iconic":
+                return
+        except tk.TclError:
+            return
+        if not self.tray.ensure_icon():
+            self._log("托盘图标当前不可用，已最小化到任务栏。", "orange")
+            return
+        self._hide_to_tray()
 
     def _on_close(self):
-        if self.allow_bg_var.get() and self.tray is not None:
-            self.root.withdraw()
-            self._log("已最小化到系统托盘。右键图标可“打开/退出”。", "")
-        else:
+        if self._quitting:
+            return
+        if not self.allow_bg_var.get() or self.tray is None:
             self._do_quit()
+            return
+        if not self.tray.ensure_icon():
+            # 托盘里没有图标还隐藏窗口的话，用户就再也找不回程序了
+            self._log("托盘图标不可用，无法隐藏窗口。", "red")
+            if messagebox.askyesno(
+                "提示",
+                "系统托盘图标当前不可用，隐藏窗口后将无法从托盘找回程序。\n\n是否直接退出程序？"
+            ):
+                self._do_quit()
+            return
+        self._hide_to_tray()
 
     def _do_quit(self):
         if self._quitting:
             return
         self._quitting = True
+        if self._poll_after is not None:
+            try:
+                self.root.after_cancel(self._poll_after)
+            except Exception:
+                pass
+            self._poll_after = None
         if self.monitor and self.monitor.is_alive():
             self.monitor.stop()
         if self.tray is not None:
@@ -1256,14 +1499,25 @@ class App:
                 self.tray.shutdown()
             except Exception:
                 pass
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def _log(self, msg, color=""):
-        self.log_text.configure(state="normal")
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.log_text.insert("end", "[%s] %s\n" % (ts, msg), color)
-        self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        try:
+            # emit() 产生的日志已经带了 [HH:MM:SS] 前缀，这里不要重复加
+            if re.match(r"^\[\d{2}:\d{2}:\d{2}\]", msg):
+                line = msg
+            else:
+                line = "[%s] %s" % (datetime.now().strftime("%H:%M:%S"), msg)
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line + "\n", color)
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        except tk.TclError:
+            # 窗口已经销毁（正在退出）时忽略
+            pass
 
     def _set_status(self, text, hit):
         self.status_var.set(text)
@@ -1276,8 +1530,11 @@ class App:
         self.indicator.itemconfigure(self.dot, fill=color)
 
     def _poll_queue(self):
+        self._poll_after = None
+        if self._quitting:
+            return
         try:
-            while True:
+            while not self._quitting:
                 item = UI_QUEUE.get_nowait()
                 kind = item[0]
                 if kind == "log":
@@ -1292,7 +1549,9 @@ class App:
                     self._log("测试结果：%s" % ("成功" if ok else "失败"),
                               "" if ok else "red")
                     self._refresh_key_status()
-                    messagebox.showinfo("测试连接", "登录%s" % ("成功" if ok else "失败"))
+                    # 窗口在托盘里时不要莫名其妙弹出对话框
+                    if self.root.winfo_viewable():
+                        messagebox.showinfo("测试连接", "登录%s" % ("成功" if ok else "失败"))
                 elif kind == "tray":
                     cmd = item[1]
                     if cmd == "open":
@@ -1301,7 +1560,15 @@ class App:
                         self._do_quit()
         except queue.Empty:
             pass
-        self.root.after(120, self._poll_queue)
+        except tk.TclError:
+            # 窗口已销毁，停止轮询
+            return
+        if self._quitting:
+            return
+        try:
+            self._poll_after = self.root.after(120, self._poll_queue)
+        except tk.TclError:
+            pass
 
 
 # ==================== 单实例 ====================
@@ -1317,15 +1584,35 @@ class SingleInstance:
         self.server_sock = None
 
     def acquire(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            s.bind((self.host, self.port))
-            s.listen(5)
-            self.server_sock = s
-            return True
-        except OSError:
-            s.close()
-            return not self._wake_existing()
+        # 端口可能因为上一次退出留下的 TIME_WAIT 短暂不可用，先重试几次
+        s = None
+        last_err = None
+        for _attempt in range(3):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.bind((self.host, self.port))
+                s.listen(5)
+                self.server_sock = s
+                return True
+            except OSError as e:
+                last_err = e
+                try:
+                    s.close()
+                except OSError:
+                    pass
+                s = None
+                time.sleep(0.3)
+
+        # 端口被占用：如果确实是本程序的旧实例，就唤醒它并退出自己不重复启动
+        if self._wake_existing():
+            return False
+
+        # 端口被别的程序占着（或防火墙拦截），单实例功能不可用，
+        # 但程序本身仍然应该能正常启动
+        logging.warning("单实例端口 %s:%s 被占用且无法唤醒已有实例（%s），"
+                        "本次将不启用单实例保护。", self.host, self.port, last_err)
+        self.server_sock = None
+        return True
 
     def _wake_existing(self):
         try:
@@ -1349,10 +1636,15 @@ class SingleInstance:
                 pass
 
     def start(self, on_activate):
+        if self.server_sock is None:
+            # 没有监听套接字（单实例保护不可用），不启动监听线程
+            return
+        sock = self.server_sock
+
         def _loop():
             while True:
                 try:
-                    conn, _addr = self.server_sock.accept()
+                    conn, _addr = sock.accept()
                 except OSError:
                     break
                 try:
