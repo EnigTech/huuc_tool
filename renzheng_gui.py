@@ -5,7 +5,6 @@ huuc校园网断网自动重连工具 —— 图形界面版
 加密方式（来源于抓取到的认证页 JS）：
     key = ip[0] ^ ip[1] ^ ... ^ ip[n]      # 本机 IP 每个字符的 ASCII 码逐字符异或
     加密 = 每个明文字符 XOR key 后转两位十六进制
-    jsVersion = "4.2.1"
 """
 import http.cookiejar
 import json
@@ -260,8 +259,7 @@ CARRIER_LABEL = {
     "cmcc":   "移动",
 }
 
-# 从抓取到的认证页 JS 中确认：jsVersion = "4.2.1"
-JS_VERSION = "4.2.1"
+JS_VERSION = ""
 
 LOGIN_URL = "https://netauth.huuc.edu.cn:802/eportal/portal/login"
 PORTAL_URL = "https://netauth.huuc.edu.cn:802/eportal/portal/jsp/portal/tp-common-redirect.jsp"
@@ -272,7 +270,7 @@ PING_HOSTS = [
     "www.taobao.com",
     "aliyun.com",
 ]
-PING_TIMEOUT_SEC = 3
+PING_TIMEOUT_SEC = 1
 DEFAULT_INTERVAL_SEC = 5
 RETRY_DELAY_SEC = 5
 AFTER_LOGIN_WAIT_SEC = 8
@@ -343,7 +341,7 @@ def do_ping(host):
     is_win = sysname.startswith("win")
     count_arg = "-n" if is_win else "-c"
     timeout_arg = "-w" if is_win else "-W"
-    cmd = ["ping", count_arg, "1", timeout_arg, str(PING_TIMEOUT_SEC), host]
+    cmd = ["ping", count_arg, "1", timeout_arg, str(PING_TIMEOUT_SEC * 1000), host]
     try:
         if is_win:
             out = subprocess.check_output(cmd, stderr=subprocess.STDOUT,
@@ -461,7 +459,7 @@ def do_login(account=None, password=None, allow_interactive=True):
     fetch_portal_cookie()
 
     key = calc_key_from_ip(local_ip)
-    _log_debug("本机 IP: %s，账号: %s，加密密钥: 0x%02X (jsVersion=%s)",
+    _log_debug("本机 IP: %s，账号: %s，加密密钥: 0x%02X",
                local_ip, full_account(acc), key, JS_VERSION)
 
     ok, msg = _try_login_with_key(acc, pwd, local_ip, key, JS_VERSION)
@@ -909,7 +907,7 @@ class App:
             self.key_var.set("（无法获取本机 IP）")
             return
         key = calc_key_from_ip(ip)
-        self.key_var.set("0x%02X（由本机 IP %s 计算，jsVersion=%s）" % (key, ip, JS_VERSION))
+        self.key_var.set("0x%02X（由本机 IP %s 计算）" % (key, ip))
 
     def _build_ui(self):
         style = ttk.Style()
