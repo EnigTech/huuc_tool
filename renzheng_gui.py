@@ -272,16 +272,37 @@ JS_VERSION = ""
 LOGIN_URL = "https://netauth.huuc.edu.cn:802/eportal/portal/login"
 PORTAL_URL = "https://netauth.huuc.edu.cn:802/eportal/portal/jsp/portal/tp-common-redirect.jsp"
 
+# ---- 联网探测：ICMP 与 TCP 两种方式同时进行，任意一种里任意一个目标通了就算联网 ----
+# 域名类目标：DNS 正常时最有代表性，也是最接近"网页能不能打开"的判据
 PING_HOSTS = [
     "www.baidu.com",
     "www.qq.com",
     "www.taobao.com",
+    "www.jd.com",
+    "www.bilibili.com",
     "aliyun.com",
 ]
-PING_TIMEOUT_SEC = 1
+# 注意：不要把公共 DNS（223.5.5.5、119.29.29.29 等）当成探测目标。
+# 校园网在"未认证"状态下通常仍然放行 DNS，探测这类地址会得到"假在线"，
+# 结果就是永远不触发认证。所有目标都必须是真正需要认证才能访问的外部地址。
+# TCP 探测：连 443 并完成 TLS 握手，能识别"TCP 被放行但外网其实不通"的伪在线
+TCP_PROBE_HOSTS = [
+    ("www.baidu.com", 443),
+    ("www.qq.com", 443),
+    ("www.jd.com", 443),
+    ("www.bilibili.com", 443),
+]
+NET_PROBE_TIMEOUT_SEC = 1          # 正常探测超时：每个目标 1 秒
+TLS_HANDSHAKE_TIMEOUT_SEC = 2      # TLS 握手额外给 2 秒
+PING_TIMEOUT_SEC = NET_PROBE_TIMEOUT_SEC
+
 DEFAULT_INTERVAL_SEC = 5
-RETRY_DELAY_SEC = 5
-AFTER_LOGIN_WAIT_SEC = 8
+RETRY_DELAY_SEC = 5                # 认证失败后的重试间隔
+AFTER_LOGIN_WAIT_SEC = 5           # 认证返回"成功"后，先等 5 秒再检测联网
+AUTH_RETRY_DELAY_SEC = 20          # 认证成功但仍未连通时的再检测间隔（不重复认证）
+FAIL_THRESHOLD = 3                 # 连续 3 次探测失败才判定断网
+AUTH_COOLDOWN_SEC = 30             # 两次认证之间的最小间隔，避免高频认证触发风控
+LOCK_BACKOFF_SEC = 180             # 命中"账号被锁"后的退避时间
 HTTP_TIMEOUT_SEC = 15
 
 if getattr(sys, "frozen", False):
@@ -350,31 +371,125 @@ def get_local_ip():
         return ""
 
 
-def do_ping(host):
-    sysname = platform.system().lower()
-    is_win = sysname.startswith("win")
+def _is_ip_host(host):
+    return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host or ""))
+
+
+_TLS_CTX = None
+
+
+def _tls_context():
+    """面向公网的 TLS 校验上下文；建立失败时返回 None（退化为只看 TCP 连通）。"""
+    global _TLS_CTX
+    if _TLS_CTX is None:
+        try:
+            _TLS_CTX = ssl.create_default_context()
+        except Exception:
+            _TLS_CTX = False
+    return _TLS_CTX or None
+
+
+def do_ping(host, timeout=None):
+    """ICMP 探测。
+
+    Windows 的 ping.exe 在"请求超时"时退出码也可能是 0，所以不能只看退出码，
+    必须同时确认输出里出现了真正的回复标志（ttl= / reply from）。
+    """
+    timeout = NET_PROBE_TIMEOUT_SEC if timeout is None else timeout
+    is_win = platform.system().lower().startswith("win")
     count_arg = "-n" if is_win else "-c"
     timeout_arg = "-w" if is_win else "-W"
-    cmd = ["ping", count_arg, "1", timeout_arg, str(PING_TIMEOUT_SEC * 1000), host]
+    timeout_val = str(max(1, int(timeout * 1000))) if is_win else str(max(1, int(timeout)))
+    cmd = ["ping", count_arg, "1", timeout_arg, timeout_val, host]
+    kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout + 3)
+    if is_win:
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        if is_win:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT,
-                                          timeout=PING_TIMEOUT_SEC + 5,
-                                          creationflags=subprocess.CREATE_NO_WINDOW)
-        else:
-            out = subprocess.check_output(cmd, stderr=subprocess.STDOUT,
-                                          timeout=PING_TIMEOUT_SEC + 5)
-        text = out.decode("gbk", errors="ignore") if is_win else out.decode("utf-8", errors="ignore")
+        proc = subprocess.run(cmd, **kwargs)
+        text = proc.stdout.decode("gbk" if is_win else "utf-8", errors="ignore")
         low = text.lower()
-        return "ttl=" in low or ("0%" in low and "loss" in low)
+        return proc.returncode == 0 and ("ttl=" in low or "reply from" in low)
     except Exception:
         return False
 
 
-def check_network():
+def do_tcp_probe(host, port=443, timeout=None):
+    """TCP 探测：连上端口后尽量完成 TLS 握手并校验证书。
+
+    只做 TCP 连接不够可靠——认证网关常把所有 443 连接劫持到自己的服务器，
+    TCP 能连上但外网根本不通。真正完成 TLS 握手并验证证书，才说明到了目标站点。
+    """
+    timeout = NET_PROBE_TIMEOUT_SEC if timeout is None else timeout
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        if port != 443:
+            return True
+        ip_target = _is_ip_host(host)
+        ctx = _tls_context()
+        if ctx is None:
+            return True
+        if ip_target:
+            # 直接连 IP 时证书里的主机名对不上，这里只校验证书链，不校验主机名
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.load_default_certs()
+        sock.settimeout(TLS_HANDSHAKE_TIMEOUT_SEC)
+        with ctx.wrap_socket(sock, server_hostname=None if ip_target else host) as tls:
+            tls.getpeercert()
+        sock = None          # wrap_socket 的 with 已经关闭了底层 socket
+        return True
+    except Exception:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _probe_targets():
+    targets = []
     for host in PING_HOSTS:
-        if do_ping(host):
-            return True, host
+        targets.append(("ICMP %s" % host, do_ping, (host,)))
+    for host, port in TCP_PROBE_HOSTS:
+        targets.append(("TCP %s:%d" % (host, port), do_tcp_probe, (host, port)))
+    return targets
+
+
+def check_network():
+    """并行执行 ICMP 与 TCP 探测，任意一个目标通了就立即返回 (True, 命中的目标)。
+
+    并发是为了两件事：联网时能在几十毫秒内返回；真正断网时也不会因为
+    十几个目标串行各等 1 秒而把一次探测拖到十几秒。
+    """
+    targets = _probe_targets()
+    done = queue.Queue()
+
+    def _run(label, fn, args):
+        try:
+            ok = bool(fn(*args))
+        except Exception:
+            ok = False
+        done.put((ok, label))
+
+    for label, fn, args in targets:
+        threading.Thread(target=_run, args=(label, fn, args),
+                         daemon=True, name="probe").start()
+
+    deadline = time.time() + NET_PROBE_TIMEOUT_SEC + TLS_HANDSHAKE_TIMEOUT_SEC + 3
+    for _ in range(len(targets)):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        try:
+            ok, label = done.get(timeout=remaining)
+        except queue.Empty:
+            break
+        if ok:
+            return True, label
     return False, None
 
 
@@ -456,8 +571,24 @@ def _try_login_with_key(acc, pwd, local_ip, key, js_ver):
         return False, str(e)
 
 
+_AUTH_LOCK = threading.Lock()        # 同一时刻只允许一次认证，监控线程与"测试连接"共用
+_LAST_AUTH_TS = 0.0                  # 最近一次认证发起的时间戳（用于全局限流）
+_LOCK_HINTS = ("user locked", "locked", "锁定", "频繁", "too many", "频繁认证")
+
+
+def _is_lock_message(msg):
+    """判断认证返回是否属于"账号被风控锁定"。"""
+    low = (msg or "").lower()
+    return any(k in low for k in _LOCK_HINTS)
+
+
+def last_auth_gap():
+    """距离最近一次认证已经过去多少秒。"""
+    return time.time() - _LAST_AUTH_TS
+
+
 def do_login(account=None, password=None, allow_interactive=True):
-    """执行一次校园网认证。
+    """执行一次校园网认证，返回 (是否成功, 服务器返回的说明)。
 
     密钥由本机 IP 动态计算得到（见 calc_key_from_ip），无需任何探测。
     allow_interactive 参数保留以兼容旧调用，当前实现中不再使用。
@@ -465,10 +596,24 @@ def do_login(account=None, password=None, allow_interactive=True):
     acc = account if account is not None else ACCOUNT
     pwd = password if password is not None else PASSWORD
 
+    # 串行化：监控线程自动重连和用户点"测试连接"如果同时认证，
+    # 很容易被服务器判定为高频认证并锁账号（日志里出现过 Rad:User Locked）。
+    if not _AUTH_LOCK.acquire(timeout=HTTP_TIMEOUT_SEC + 5):
+        emit("warn", "另一次认证正在进行，本次跳过。")
+        return False, "busy"
+    global _LAST_AUTH_TS
+    _LAST_AUTH_TS = time.time()
+    try:
+        return _do_login_locked(acc, pwd)
+    finally:
+        _AUTH_LOCK.release()
+
+
+def _do_login_locked(acc, pwd):
     local_ip = get_local_ip()
     if not local_ip:
         emit("error", "无法获取本机 IP，无法计算加密密钥。")
-        return False
+        return False, "无法获取本机 IP"
 
     fetch_portal_cookie()
 
@@ -479,9 +624,9 @@ def do_login(account=None, password=None, allow_interactive=True):
     ok, msg = _try_login_with_key(acc, pwd, local_ip, key, JS_VERSION)
     if ok:
         _log_debug("认证成功。")
-        return True
+        return True, msg
     emit("error", "认证失败：%s" % msg)
-    return False
+    return False, msg
 
 
 def _log_debug(fmt, *args):
@@ -550,10 +695,12 @@ class MonitorThread(threading.Thread):
         UI_QUEUE.put(("status", ok, hit))
         emit("info", "初始状态：%s（命中 %s）" % ("在线" if ok else "离线", hit or "-"))
 
+        fail_count = 0
         while not self._stop_evt.is_set():
             ok, hit = check_network()
 
             if ok:
+                fail_count = 0
                 if not self.online:
                     self.online = True
                     emit("info", "网络已恢复（命中 %s）" % hit)
@@ -562,12 +709,34 @@ class MonitorThread(threading.Thread):
                     break
                 continue
 
+            # 探测不通：先不急着认证。校园网抖动、认证生效延迟、ICMP 被限速
+            # 都会造成单次探测失败，连续多次失败才说明真的断网了。
             self.online = False
             UI_QUEUE.put(("status", False, None))
-            emit("warn", "全部探测目标不通，判定断网，开始认证...")
+            fail_count += 1
+            if fail_count < FAIL_THRESHOLD:
+                emit("warn", "探测失败（%d/%d，可能只是抖动），继续观察..."
+                     % (fail_count, FAIL_THRESHOLD))
+                if self._wait(self.interval):
+                    break
+                continue
 
-            if do_login(self.account, self.password):
-                emit("info", "认证请求已发送，等待网络恢复...")
+            emit("warn", "连续 %d 次探测失败，判定断网，开始认证..." % fail_count)
+
+            gap = last_auth_gap()
+            if gap < AUTH_COOLDOWN_SEC:
+                wait_s = int(AUTH_COOLDOWN_SEC - gap) + 1
+                emit("info", "%d 秒前刚认证过，为避免高频认证触发风控，%d 秒后再尝试。"
+                     % (int(gap), wait_s))
+                if self._wait(wait_s):
+                    break
+                continue
+
+            ok_login, msg = do_login(self.account, self.password)
+            fail_count = 0
+
+            if ok_login:
+                emit("info", "认证请求已发送，%d 秒后检测网络是否恢复..." % AFTER_LOGIN_WAIT_SEC)
                 if self._wait(AFTER_LOGIN_WAIT_SEC):
                     break
                 ok2, hit2 = check_network()
@@ -576,11 +745,18 @@ class MonitorThread(threading.Thread):
                     emit("info", "登录后网络已恢复（命中 %s）" % hit2)
                     UI_QUEUE.put(("status", True, hit2))
                 else:
-                    emit("warn", "已认证但网络未恢复，%d 秒后重试" % RETRY_DELAY_SEC)
-                    if self._wait(RETRY_DELAY_SEC):
+                    emit("warn", "认证成功但网络仍未连通，%d 秒后再检测（不重复认证）。"
+                         % AUTH_RETRY_DELAY_SEC)
+                    if self._wait(AUTH_RETRY_DELAY_SEC):
                         break
+            elif _is_lock_message(msg):
+                emit("error", "账号被认证服务器锁定（%s），%d 秒内不再重试。"
+                     "期间请勿反复点“测试连接”，必要时联系网络中心解除。"
+                     % (msg, LOCK_BACKOFF_SEC))
+                if self._wait(LOCK_BACKOFF_SEC):
+                    break
             else:
-                emit("error", "认证失败，%d 秒后重试" % RETRY_DELAY_SEC)
+                emit("error", "认证失败（%s），%d 秒后重试" % (msg, RETRY_DELAY_SEC))
                 if self._wait(RETRY_DELAY_SEC):
                     break
 
@@ -1249,8 +1425,8 @@ class App:
             self._log("正在测试登录（账号 %s）..." % full_account(acc), "")
 
         def worker():
-            ok = do_login(acc, pwd)
-            UI_QUEUE.put(("result", ok))
+            ok, msg = do_login(acc, pwd)
+            UI_QUEUE.put(("result", ok, msg))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1546,12 +1722,16 @@ class App:
                     self._refresh_key_status()
                 elif kind == "result":
                     ok = item[1]
+                    reason = item[2] if len(item) > 2 else ""
                     self._log("测试结果：%s" % ("成功" if ok else "失败"),
                               "" if ok else "red")
+                    if not ok and reason:
+                        self._log("失败原因：%s" % reason, "red")
                     self._refresh_key_status()
                     # 窗口在托盘里时不要莫名其妙弹出对话框
                     if self.root.winfo_viewable():
-                        messagebox.showinfo("测试连接", "登录%s" % ("成功" if ok else "失败"))
+                        detail = "登录成功" if ok else "登录失败：%s" % (reason or "未知原因")
+                        messagebox.showinfo("测试连接", detail)
                 elif kind == "tray":
                     cmd = item[1]
                     if cmd == "open":
