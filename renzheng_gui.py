@@ -12,6 +12,7 @@ import logging
 import os
 import platform
 import queue
+import random
 import re
 import socket
 import ssl
@@ -33,17 +34,44 @@ except ImportError:
 
 # ==================== 开机自启 ====================
 AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+# Windows 的处理顺序是 RunOnce 早于 Run，所以这里同时写一份 RunOnce，
+# 让程序在登录后尽可能早地跑起来（RunOnce 执行完会自动删除，程序启动时再补写）。
+AUTOSTART_RUNONCE_KEY = r"Software\Microsoft\Windows\CurrentVersion\RunOnce"
 AUTOSTART_VALUE_NAME = "huuc校园网自动重连工具"
+
+AUTOSTART_FLAG = "--autostart"
 
 
 def _autostart_command():
+    """开机自启命令行（带 --autostart，程序据此跳过首次探测、直接认证）。"""
     if getattr(sys, "frozen", False):
-        return '"%s"' % sys.executable
+        return '"%s" %s' % (sys.executable, AUTOSTART_FLAG)
     pyw = sys.executable if sys.executable.lower().endswith("pythonw.exe") else \
         os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     if not pyw or not os.path.exists(pyw):
         pyw = sys.executable
-    return '"%s" "%s"' % (pyw, os.path.abspath(__file__))
+    return '"%s" "%s" %s' % (pyw, os.path.abspath(__file__), AUTOSTART_FLAG)
+
+
+def _set_reg_value(subkey, name, value):
+    """写（value 非 None）或删（value 为 None）一个 HKCU 字符串值。"""
+    if winreg is None:
+        return False, "当前系统不支持注册表"
+    try:
+        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, subkey)
+        try:
+            if value is None:
+                try:
+                    winreg.DeleteValue(key, name)
+                except OSError:
+                    pass
+            else:
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, value)
+        finally:
+            winreg.CloseKey(key)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 def is_autostart_enabled():
@@ -61,24 +89,30 @@ def is_autostart_enabled():
 
 
 def set_autostart(enabled):
+    """开启/关闭开机自启。
+
+    开启时写两处：Run（持久）与 RunOnce（登录后最早被处理，执行完即删除）。
+    程序每次启动都会调用本函数补写 RunOnce，所以每个开机周期都能最早启动。
+    """
     if winreg is None:
         return False, "当前系统不支持注册表自启"
+    cmd = _autostart_command() if enabled else None
+    ok1, err1 = _set_reg_value(AUTOSTART_REG_KEY, AUTOSTART_VALUE_NAME, cmd)
+    ok2, err2 = _set_reg_value(AUTOSTART_RUNONCE_KEY, AUTOSTART_VALUE_NAME, cmd)
+    if ok1:
+        return True, "" if ok2 else err2
+    return False, err1 or err2
+
+
+def refresh_autostart():
+    """程序启动时调用：把自启命令刷新成最新格式，并补写 RunOnce 抢开机优先级。"""
     try:
-        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY)
-        try:
-            if enabled:
-                winreg.SetValueEx(key, AUTOSTART_VALUE_NAME, 0, winreg.REG_SZ,
-                                  _autostart_command())
-            else:
-                try:
-                    winreg.DeleteValue(key, AUTOSTART_VALUE_NAME)
-                except OSError:
-                    pass
-        finally:
-            winreg.CloseKey(key)
-        return True, ""
-    except Exception as e:
-        return False, str(e)
+        if is_autostart_enabled():
+            ok, _err = set_autostart(True)
+            return ok
+    except Exception:
+        pass
+    return False
 
 
 # ==================== 配置持久化（注册表） ====================
@@ -236,18 +270,8 @@ def reg_clear_settings(include_autostart=True):
             finally:
                 winreg.CloseKey(key)
         if include_autostart:
-            try:
-                rk = winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0,
-                                    winreg.KEY_ALL_ACCESS)
-                try:
-                    try:
-                        winreg.DeleteValue(rk, AUTOSTART_VALUE_NAME)
-                    except OSError:
-                        pass
-                finally:
-                    winreg.CloseKey(rk)
-            except OSError:
-                pass
+            _set_reg_value(AUTOSTART_REG_KEY, AUTOSTART_VALUE_NAME, None)
+            _set_reg_value(AUTOSTART_RUNONCE_KEY, AUTOSTART_VALUE_NAME, None)
         return True, ""
     except Exception as e:
         return False, str(e)
@@ -272,35 +296,45 @@ JS_VERSION = ""
 LOGIN_URL = "https://netauth.huuc.edu.cn:802/eportal/portal/login"
 PORTAL_URL = "https://netauth.huuc.edu.cn:802/eportal/portal/jsp/portal/tp-common-redirect.jsp"
 
-# ---- 联网探测：ICMP 与 TCP 两种方式同时进行，任意一种里任意一个目标通了就算联网 ----
-# 域名类目标：DNS 正常时最有代表性，也是最接近"网页能不能打开"的判据
+# ---- 联网探测：ICMP 与 TCP 两条线并行独立运行，任意一条线命中即算联网 ----
+# 每条线每轮从下面的候选里【随机抽 3 个】目标串行探测（每个最多 1 秒、命中即止），
+# 所以每条线最坏耗时约 3 秒；两条线并行，因此一次完整探测最坏也是约 3 秒。
+# 只有两条线各自的 3 个目标全部失败，才判定为"离线"。
+#
+# 注意：不要用公共 DNS（223.5.5.5、119.29.29.29 等）当目标。
+# 校园网在未认证状态下通常仍然放行 DNS，拿这类地址探测会得到"假在线"。
+# 下面的目标都是 2026-11-06 在本机联网状态下实测 ICMP / TCP443 全部可通的站点。
 PING_HOSTS = [
     "www.baidu.com",
     "www.qq.com",
     "www.taobao.com",
     "www.jd.com",
     "www.bilibili.com",
-    "aliyun.com",
+    "www.163.com",
+    "www.sina.com.cn",
+    "www.zhihu.com",
 ]
-# 注意：不要把公共 DNS（223.5.5.5、119.29.29.29 等）当成探测目标。
-# 校园网在"未认证"状态下通常仍然放行 DNS，探测这类地址会得到"假在线"，
-# 结果就是永远不触发认证。所有目标都必须是真正需要认证才能访问的外部地址。
-# TCP 探测：连 443 并完成 TLS 握手，能识别"TCP 被放行但外网其实不通"的伪在线
+# TCP 探测：连 443 并完成 TLS 握手 + 证书校验，能识别"TCP 被放行但外网其实不通"的伪在线
 TCP_PROBE_HOSTS = [
     ("www.baidu.com", 443),
     ("www.qq.com", 443),
+    ("www.taobao.com", 443),
     ("www.jd.com", 443),
     ("www.bilibili.com", 443),
+    ("www.163.com", 443),
+    ("www.sohu.com", 443),
+    ("www.iqiyi.com", 443),
 ]
-NET_PROBE_TIMEOUT_SEC = 1          # 正常探测超时：每个目标 1 秒
-TLS_HANDSHAKE_TIMEOUT_SEC = 2      # TLS 握手额外给 2 秒
+PROBE_SAMPLE_COUNT = 3             # 每轮每条线随机抽几个目标
+NET_PROBE_TIMEOUT_SEC = 1          # 单个目标超时 1 秒
+PROBE_METHOD_BUDGET_SEC = 3        # 每条线整体预算 3 秒（3 个目标 × 1 秒）
 PING_TIMEOUT_SEC = NET_PROBE_TIMEOUT_SEC
 
 DEFAULT_INTERVAL_SEC = 5
 RETRY_DELAY_SEC = 5                # 认证失败后的重试间隔
 AFTER_LOGIN_WAIT_SEC = 5           # 认证返回"成功"后，先等 5 秒再检测联网
 AUTH_RETRY_DELAY_SEC = 20          # 认证成功但仍未连通时的再检测间隔（不重复认证）
-FAIL_THRESHOLD = 3                 # 连续 3 次探测失败才判定断网
+FAIL_THRESHOLD = 1                 # 一轮探测（最长约 3 秒）失败即判定断网，不再累计多次
 AUTH_COOLDOWN_SEC = 30             # 两次认证之间的最小间隔，避免高频认证触发风控
 LOCK_BACKOFF_SEC = 180             # 命中"账号被锁"后的退避时间
 HTTP_TIMEOUT_SEC = 15
@@ -414,12 +448,15 @@ def do_ping(host, timeout=None):
 
 
 def do_tcp_probe(host, port=443, timeout=None):
-    """TCP 探测：连上端口后尽量完成 TLS 握手并校验证书。
+    """TCP 探测：连上端口后完成 TLS 握手并校验证书。
 
     只做 TCP 连接不够可靠——认证网关常把所有 443 连接劫持到自己的服务器，
     TCP 能连上但外网根本不通。真正完成 TLS 握手并验证证书，才说明到了目标站点。
+    timeout 是"这一个目标"的总预算：连接和握手共用它，保证不会超时太久。
     """
     timeout = NET_PROBE_TIMEOUT_SEC if timeout is None else timeout
+    spent = 0.0
+    started = time.time()
     sock = None
     try:
         sock = socket.create_connection((host, port), timeout=timeout)
@@ -435,7 +472,8 @@ def do_tcp_probe(host, port=443, timeout=None):
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_REQUIRED
             ctx.load_default_certs()
-        sock.settimeout(TLS_HANDSHAKE_TIMEOUT_SEC)
+        spent = time.time() - started
+        sock.settimeout(max(0.2, timeout - spent))
         with ctx.wrap_socket(sock, server_hostname=None if ip_target else host) as tls:
             tls.getpeercert()
         sock = None          # wrap_socket 的 with 已经关闭了底层 socket
@@ -450,47 +488,80 @@ def do_tcp_probe(host, port=443, timeout=None):
                 pass
 
 
-def _probe_targets():
-    targets = []
-    for host in PING_HOSTS:
-        targets.append(("ICMP %s" % host, do_ping, (host,)))
-    for host, port in TCP_PROBE_HOSTS:
-        targets.append(("TCP %s:%d" % (host, port), do_tcp_probe, (host, port)))
-    return targets
+def _sample_targets(pool):
+    """从目标池随机抽取至多 PROBE_SAMPLE_COUNT 个（池子不足时全部打乱后取用）。"""
+    pool = list(pool)
+    if len(pool) <= PROBE_SAMPLE_COUNT:
+        random.shuffle(pool)
+        return pool
+    return random.sample(pool, PROBE_SAMPLE_COUNT)
+
+
+def probe_ping():
+    """ICMP 线：随机抽 3 个目标串行探测，每个最多 1 秒，命中即返回。
+
+    串行而不是并行，是为了把"最坏耗时"锁死在约 3 秒（3 × 1 秒）。
+    """
+    deadline = time.time() + PROBE_METHOD_BUDGET_SEC
+    for host in _sample_targets(PING_HOSTS):
+        remaining = deadline - time.time()
+        if remaining <= 0.05:
+            break
+        if do_ping(host, timeout=min(NET_PROBE_TIMEOUT_SEC, remaining)):
+            return True, "ICMP %s" % host
+    return False, None
+
+
+def probe_tcp():
+    """TCP 线：随机抽 3 个目标串行探测，每个最多 1 秒，命中即返回。"""
+    deadline = time.time() + PROBE_METHOD_BUDGET_SEC
+    for host, port in _sample_targets(TCP_PROBE_HOSTS):
+        remaining = deadline - time.time()
+        if remaining <= 0.05:
+            break
+        if do_tcp_probe(host, port, timeout=min(NET_PROBE_TIMEOUT_SEC, remaining)):
+            return True, "TCP %s:%d" % (host, port)
+    return False, None
 
 
 def check_network():
-    """并行执行 ICMP 与 TCP 探测，任意一个目标通了就立即返回 (True, 命中的目标)。
+    """ICMP 线与 TCP 线并行独立运行，任意一条命中即返回 (True, 命中的目标)。
 
-    并发是为了两件事：联网时能在几十毫秒内返回；真正断网时也不会因为
-    十几个目标串行各等 1 秒而把一次探测拖到十几秒。
+    只有当两条线各自随机选的 3 个目标全部失败（最长约 3 秒）时，才返回 (False, None)。
     """
-    targets = _probe_targets()
     done = queue.Queue()
 
-    def _run(label, fn, args):
+    def _run(kind, fn):
         try:
-            ok = bool(fn(*args))
+            ok, hit = fn()
         except Exception:
-            ok = False
-        done.put((ok, label))
+            ok, hit = False, None
+        done.put((kind, ok, hit))
 
-    for label, fn, args in targets:
-        threading.Thread(target=_run, args=(label, fn, args),
-                         daemon=True, name="probe").start()
+    for kind, fn in (("ping", probe_ping), ("tcp", probe_tcp)):
+        threading.Thread(target=_run, args=(kind, fn),
+                         daemon=True, name="probe-%s" % kind).start()
 
-    deadline = time.time() + NET_PROBE_TIMEOUT_SEC + TLS_HANDSHAKE_TIMEOUT_SEC + 3
-    for _ in range(len(targets)):
+    deadline = time.time() + PROBE_METHOD_BUDGET_SEC + 1.0
+    for _ in range(2):
         remaining = deadline - time.time()
         if remaining <= 0:
             break
         try:
-            ok, label = done.get(timeout=remaining)
+            _kind, ok, hit = done.get(timeout=remaining)
         except queue.Empty:
             break
         if ok:
-            return True, label
+            return True, hit
     return False, None
+
+
+def _probe_targets():
+    """给自检/测试用：列出两条线各自可能探测的目标。"""
+    targets = [("ICMP %s" % h, do_ping, (h,), probe_ping) for h in PING_HOSTS]
+    targets += [("TCP %s:%d" % (h, p), do_tcp_probe, (h, p), probe_tcp)
+                for h, p in TCP_PROBE_HOSTS]
+    return [(label, fn, args) for label, fn, args, _ in targets]
 
 
 COOKIE_JAR = http.cookiejar.CookieJar()
@@ -629,6 +700,28 @@ def _do_login_locked(acc, pwd):
     return False, msg
 
 
+BOOT_LOGIN_EVENT = threading.Event()   # 开机自启时的那一次"先认证"何时完成
+
+
+def boot_login_once():
+    """开机自启专用：开机后网络必然是断的，先直接认证一次，不做探测。"""
+    try:
+        emit("info", "开机自启：跳过首次探测，直接认证一次。")
+        ok, msg = do_login()
+        if ok:
+            emit("info", "开机认证成功（%s），%d 秒后开始探测。" % (msg, AFTER_LOGIN_WAIT_SEC))
+            BOOT_LOGIN_EVENT.wait(AFTER_LOGIN_WAIT_SEC)
+        elif _is_lock_message(msg):
+            emit("error", "开机认证被服务器锁定（%s），%d 秒内不再重试。" % (msg, LOCK_BACKOFF_SEC))
+            BOOT_LOGIN_EVENT.wait(min(LOCK_BACKOFF_SEC, 5))
+        else:
+            emit("error", "开机认证失败（%s），交给监控继续处理。" % msg)
+    except Exception as e:
+        emit("error", "开机认证异常：%s" % e)
+    finally:
+        BOOT_LOGIN_EVENT.set()
+
+
 def _log_debug(fmt, *args):
     try:
         UI_QUEUE.put(("log", "[DBG] " + (fmt % args if args else fmt)))
@@ -670,11 +763,12 @@ def emit(level, msg):
 
 # ==================== 后台监控线程 ====================
 class MonitorThread(threading.Thread):
-    def __init__(self, interval, account, password):
+    def __init__(self, interval, account, password, skip_first_probe=False):
         super().__init__(daemon=True)
         self.interval = max(3, int(interval))
         self.account = account
         self.password = password
+        self.skip_first_probe = skip_first_probe
         self._stop_evt = threading.Event()
         self.online = False
 
@@ -690,6 +784,12 @@ class MonitorThread(threading.Thread):
 
     def run(self):
         emit("info", "已启动监控，检测间隔 %d 秒。账号后缀 %s" % (self.interval, ACCOUNT_SUFFIX))
+        if self.skip_first_probe:
+            # 开机自启时，main() 已经（或正在）在 UI 起来之前跑一次认证，
+            # 这里等它结束再开始探测，避免两路同时认证。
+            emit("info", "开机自启模式：等待首次认证完成后再开始探测。")
+            BOOT_LOGIN_EVENT.wait(30)
+
         ok, hit = check_network()
         self.online = ok
         UI_QUEUE.put(("status", ok, hit))
@@ -711,6 +811,8 @@ class MonitorThread(threading.Thread):
 
             # 探测不通：先不急着认证。校园网抖动、认证生效延迟、ICMP 被限速
             # 都会造成单次探测失败，连续多次失败才说明真的断网了。
+            # 一次探测内部已经用"两条线各 3 个目标、最长约 3 秒"做了抗抖动，
+            # 所以默认一轮探测失败（FAIL_THRESHOLD=1）就直接判定断网并认证。
             self.online = False
             UI_QUEUE.put(("status", False, None))
             fail_count += 1
@@ -721,7 +823,7 @@ class MonitorThread(threading.Thread):
                     break
                 continue
 
-            emit("warn", "连续 %d 次探测失败，判定断网，开始认证..." % fail_count)
+            emit("warn", "探测失败（ICMP 与 TCP 各 3 个目标均不通，约 3 秒），判定断网，开始认证...")
 
             gap = last_auth_gap()
             if gap < AUTH_COOLDOWN_SEC:
@@ -1205,8 +1307,9 @@ else:
 
 # ==================== 图形界面 ====================
 class App:
-    def __init__(self, root):
+    def __init__(self, root, boot_autostart=False):
         self.root = root
+        self.boot_autostart = bool(boot_autostart)
         self.root.title("huuc校园网自动重连工具")
         self.root.geometry("760x560")
         self.root.minsize(640, 480)
@@ -1433,7 +1536,7 @@ class App:
     def _start(self):
         self._start_monitor(manual=True)
 
-    def _start_monitor(self, manual=True):
+    def _start_monitor(self, manual=True, skip_first_probe=False):
         if manual:
             interval = self._validate_interval()
             if interval is None:
@@ -1466,7 +1569,7 @@ class App:
             elif manual:
                 self._log("监控已经在运行中。", "orange")
             return
-        self.monitor = MonitorThread(interval, acc, pwd)
+        self.monitor = MonitorThread(interval, acc, pwd, skip_first_probe=skip_first_probe)
         self.monitor.start()
         self.start_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
@@ -1481,8 +1584,11 @@ class App:
             self._log("未检测到已保存的账号密码，未自动启动监控。"
                       "填写并保存后，点“开始监控”即可。", "orange")
             return
-        self._log("检测到已保存的账号密码，自动开始监控。", "")
-        self._start_monitor(manual=False)
+        if self.boot_autostart:
+            self._log("开机自启：已在界面启动前抢先认证一次，随后转入后台监控。", "")
+        else:
+            self._log("检测到已保存的账号密码，自动开始监控。", "")
+        self._start_monitor(manual=False, skip_first_probe=self.boot_autostart)
 
     def _stop(self):
         if self.monitor:
@@ -1849,11 +1955,17 @@ SINGLE = SingleInstance()
 
 
 def main():
+    boot_autostart = AUTOSTART_FLAG in sys.argv[1:]
     if not SINGLE.acquire():
         return
     load_credentials()
+    # 每次启动都把自启命令刷成最新格式，并补写 RunOnce 抢下一个开机的优先级
+    refresh_autostart()
+    if boot_autostart:
+        # 开机自启：开机会话里网络一定是断的，不等界面、不探测，立刻抢跑一次认证
+        threading.Thread(target=boot_login_once, daemon=True, name="boot-login").start()
     root = tk.Tk()
-    App(root)
+    App(root, boot_autostart=boot_autostart)
     SINGLE.start(lambda: UI_QUEUE.put(("tray", "open")))
     root.mainloop()
 
